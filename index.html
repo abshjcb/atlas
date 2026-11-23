@@ -3865,7 +3865,23 @@
     }
     document.addEventListener("click", e => { if (e.target.matches("[data-clearcond]")) { delete draftCond[e.target.dataset.clearcond]; renderRoutine(); setDraftFlag() } });
     if (!window.__ATLAS_TEST__) init();
-  </script>
+  </script>  
+  <script type="module">
+  import { createClient } from
+    'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm';
+
+  const SUPABASE_URL = 'https://yigpxsjtwygyjpfhntig.supabase.co/rest/v1/';
+  const SUPABASE_KEY = 'sb_publishable_dz8StD39efaMh12UsmyL0w_1vNqOJjU';
+
+  const supabase = createClient(
+    SUPABASE_URL,
+    SUPABASE_KEY
+  );
+
+  window.supabaseClient = supabase;
+
+  console.log('Supabase connected successfully!');
+</script>
 </body>
 
 </html>
