@@ -2026,6 +2026,7 @@
       }
     }
   </style>
+<style id="auth-css">.auth-err{color:#ffb4b4}.top .row .mini{white-space:nowrap}</style>
 </head>
 
 <body>
@@ -2430,7 +2431,7 @@
         </div>
       </div>
     </section>
-    <div class="foot">TRAINING ATLAS · Offline-first personal training records · No external services</div>
+    <div class="foot">TRAINING ATLAS · Personal training records · Synced to your account</div>
   </div>
 
   <script>
@@ -3359,18 +3360,18 @@
     async function idbGet() { try { const db = await idbOpen(); return await new Promise(res => { const r = db.transaction(IDB_STORE).objectStore(IDB_STORE).get("state"); r.onsuccess = () => res(r.result || null); r.onerror = () => res(null) }) } catch (e) { return null } }
     let _mirrorTimer; function scheduleMirror() { clearTimeout(_mirrorTimer); _mirrorTimer = setTimeout(() => idbPut(JSON.stringify(state)), 600) }
     async function checkRestoreFromMirror() {
-      if (HAD_LOCAL_DATA) return;
+      if (HAD_LOCAL_DATA || window.__atlasCloud) return;
       const raw = await idbGet(); const s = raw && safeParse(raw);
       if (s && s.profile && s.workouts && (Object.keys(s.workouts).length || Object.keys(s.body || {}).length)) {
         if (confirm("Your main browser storage is empty, but a mirrored copy of your Training Atlas data was found (" + Object.keys(s.workouts).length + " workout days). Restore it?")) { lsSet(STORE, raw); location.reload() }
       }
     }
     async function requestPersistence() {
-      try { if (navigator.storage && navigator.storage.persist) { const ok = await navigator.storage.persist(); $("storageStatus").title = ok ? "Browser granted persistent storage" : "Browser did not grant persistent storage; export backups regularly"; if (ok) $("storageStatus").textContent = "PERSISTENT STORAGE" } } catch (e) { }
+      try { if (navigator.storage && navigator.storage.persist) { const ok = await navigator.storage.persist(); $("storageStatus").title = ok ? "Browser granted persistent storage" : "Browser did not grant persistent storage; export backups regularly"; if (ok && !window.__atlasCloud) $("storageStatus").textContent = "PERSISTENT STORAGE" } } catch (e) { }
     }
     function daysSinceExport() { const t = state.meta && state.meta.lastExport; return t ? Math.floor((Date.now() - Date.parse(t)) / 86400000) : null }
     function renderBackupBanner() {
-      const b = $("backupBanner"); if (!b) return;
+      const b = $("backupBanner"); if (!b) return; if (window.__atlasCloud) { b.hidden = true; return }
       const hasData = Object.keys(state.workouts).length + Object.keys(state.body || {}).length >= 3, d = daysSinceExport();
       let dismissed = false; try { dismissed = sessionStorage.getItem("atlasBackupDismiss") === "1" } catch (e) { }
       const show = hasData && (d == null || d >= 7) && !dismissed; b.hidden = !show;
@@ -3461,7 +3462,7 @@
     const HAD_LOCAL_DATA = lsGet(STORE) !== null;
     let state = loadState(), draftRoutine = null, draftCond = null, selectedMuscle = "upper_chest", workMonth = new Date(), recMonth = new Date(), selectedDate = today(), selectedRecDate = today();
     const BUILTIN_EXERCISES = new Set(Object.keys(DB)); applyCustomExercises();
-    function save() { try { state.meta = state.meta || {}; state.meta.updatedAt = new Date().toISOString(); localStorage.setItem(STORE, JSON.stringify(state)); $("storageStatus").textContent = "SAVED LOCALLY"; scheduleMirror(); if ($("intelligence") && $("intelligence").classList.contains("active") && typeof renderTrainingIntelligence === "function") renderTrainingIntelligence() } catch (e) { $("storageStatus").textContent = "STORAGE ERROR"; alert("Could not save to localStorage. Export a backup and check browser storage settings.") } }
+    function save() { try { state.meta = state.meta || {}; state.meta.updatedAt = new Date().toISOString(); localStorage.setItem(STORE, JSON.stringify(state)); $("storageStatus").textContent = "SAVED LOCALLY"; scheduleMirror(); if (window.cloudScheduleSave) cloudScheduleSave(); if ($("intelligence") && $("intelligence").classList.contains("active") && typeof renderTrainingIntelligence === "function") renderTrainingIntelligence() } catch (e) { $("storageStatus").textContent = "STORAGE ERROR"; alert("Could not save to localStorage. Export a backup and check browser storage settings.") } }
     function $(id) { return document.getElementById(id) }
     function esc(s) { return String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])) }
     function activeVersion(date) { return [...state.routineVersions].filter(v => v.effectiveDate <= date).sort((a, b) => b.effectiveDate.localeCompare(a.effectiveDate) || String(b.createdAt || "").localeCompare(String(a.createdAt || "")))[0] || state.routineVersions[0] }
@@ -3864,24 +3865,160 @@
       $("importData").value = "";
     }
     document.addEventListener("click", e => { if (e.target.matches("[data-clearcond]")) { delete draftCond[e.target.dataset.clearcond]; renderRoutine(); setDraftFlag() } });
-    if (!window.__ATLAS_TEST__) init();
-  </script>  
-  <script type="module">
-  import { createClient } from
-    'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm';
+    /* ===================== CLOUD SYNC (Supabase) =====================
+       The whole app state is kept as one JSON document per user in the app_state table.
+       localStorage stays as the on-device copy, so the app still works offline. */
+    const SB_URL = "https://yigpxsjtwygyjpfhntig.supabase.co";
+    const SB_KEY = "sb_publishable_dz8StD39efaMh12UsmyL0w_1vNqOJjU";
+    const CLOUD_BASE_KEY = "trainingAtlas_cloudBase";
+    let sb = null, cloudUser = null, cloudTimer = null, cloudBusy = false, cloudDirty = false, signingOut = false;
+    window.__atlasCloud = false;
 
-  const SUPABASE_URL = 'https://yigpxsjtwygyjpfhntig.supabase.co';
-  const SUPABASE_KEY = 'sb_publishable_dz8StD39efaMh12UsmyL0w_1vNqOJjU';
+    function setSyncStatus(text, title) { const el = $("storageStatus"); if (el) { el.textContent = text; el.title = title || "" } }
+    function cloudTime(s) { return Date.parse(s && s.meta && s.meta.updatedAt) || 0 }
+    function cloudBaseTime() { return Date.parse(lsGet(CLOUD_BASE_KEY) || "") || 0 }
+    function cloudOn() { return !!(sb && cloudUser && window.__atlasCloud) }
 
-  const supabase = createClient(
-    SUPABASE_URL,
-    SUPABASE_KEY
-  );
+    /* Combine two copies: dated records are unioned, everything else comes from the newer copy. */
+    function mergeStates(local, cloud) {
+      const lNewer = cloudTime(local) >= cloudTime(cloud), newer = lNewer ? local : cloud, older = lNewer ? cloud : local, out = clone(newer);
+      ["workouts", "runs", "recovery", "body", "customExercises"].forEach(k => { out[k] = Object.assign({}, older[k] || {}, newer[k] || {}) });
+      const unionBy = (a, b, key) => { const seen = new Set((a || []).map(x => x[key])), res = (a || []).slice(); (b || []).forEach(x => { if (!seen.has(x[key])) res.push(x) }); return res };
+      out.routineVersions = unionBy(newer.routineVersions, older.routineVersions, "id").sort((x, y) => String(x.effectiveDate).localeCompare(String(y.effectiveDate)) || String(x.createdAt || "").localeCompare(String(y.createdAt || "")));
+      out.coaching = out.coaching || {};
+      out.coaching.analysisHistory = unionBy((newer.coaching || {}).analysisHistory, (older.coaching || {}).analysisHistory, "id").slice(-52);
+      out.meta = Object.assign({}, newer.meta || {}, { updatedAt: new Date().toISOString() });
+      return out;
+    }
+    /* base = the version this device last synced. Decide what to do with the local and cloud copies. */
+    function planSync(local, hadLocal, cloud, base) {
+      if (!cloud) return { action: "push", state: local };
+      const lT = hadLocal ? cloudTime(local) : 0, cT = cloudTime(cloud), localChanged = hadLocal && lT > base, cloudChanged = cT > base;
+      if (cloudChanged && localChanged) return { action: "merge", state: mergeStates(local, cloud) };
+      if (cloudChanged) return { action: "pull", state: cloud };
+      if (localChanged) return { action: "push", state: local };
+      return { action: "none", state: local };
+    }
+    async function cloudFetch() {
+      const r = await sb.from("app_state").select("state, updated_at").eq("user_id", cloudUser.id).maybeSingle();
+      if (r.error) throw r.error;
+      if (!r.data || !r.data.state || !r.data.state.profile) return null;
+      const s = r.data.state; s.meta = s.meta || {}; if (!s.meta.updatedAt) s.meta.updatedAt = r.data.updated_at; return s;
+    }
+    async function cloudWrite() {
+      state.meta = state.meta || {}; if (!state.meta.updatedAt) state.meta.updatedAt = new Date().toISOString();
+      const r = await sb.from("app_state").upsert({ user_id: cloudUser.id, state: state, updated_at: state.meta.updatedAt }, { onConflict: "user_id" });
+      if (r.error) throw r.error;
+      lsSet(CLOUD_BASE_KEY, state.meta.updatedAt);
+    }
+    async function cloudApply(plan) {
+      if (plan.action === "pull" || plan.action === "merge") { lsSet(STORE, JSON.stringify(plan.state)); state = loadState(); applyCustomExercises() }
+      if (plan.action === "merge" || plan.action === "push") await cloudWrite();
+      else if (plan.action === "pull") lsSet(CLOUD_BASE_KEY, state.meta.updatedAt || "");
+    }
+    async function cloudSync(hadLocal) { const plan = planSync(state, hadLocal, await cloudFetch(), cloudBaseTime()); await cloudApply(plan); return plan }
 
-  window.supabaseClient = supabase;
+    async function cloudPush() {
+      if (!cloudOn()) return false;
+      if (cloudBusy) { cloudDirty = true; return false }
+      cloudBusy = true; cloudDirty = false; clearTimeout(cloudTimer); cloudTimer = null;
+      let ok = false;
+      try {
+        const cur = await sb.from("app_state").select("updated_at").eq("user_id", cloudUser.id).maybeSingle();
+        if (cur.error) throw cur.error;
+        if (cur.data && Date.parse(cur.data.updated_at) > cloudBaseTime()) {
+          /* another device saved since this one last synced: combine instead of overwriting */
+          const plan = await cloudSync(true);
+          if (plan.action === "pull" || plan.action === "merge") { setSyncStatus("MERGED"); toast("Combined with newer data from another device. Reloading…"); setTimeout(() => location.reload(), 1300); return true }
+        } else await cloudWrite();
+        ok = true; setSyncStatus("SYNCED", "Saved to your account");
+      } catch (e) { console.error("Cloud save failed", e); setSyncStatus("SYNC ERROR", "Saved on this device only. " + ((e && e.message) || "")) }
+      finally { cloudBusy = false; if (cloudDirty) { cloudDirty = false; cloudScheduleSave() } }
+      return ok;
+    }
+    function cloudScheduleSave() { if (!cloudOn()) return; setSyncStatus("SYNCING…"); clearTimeout(cloudTimer); cloudTimer = setTimeout(cloudPush, 1500) }
+    window.cloudScheduleSave = cloudScheduleSave;
 
-  console.log('Supabase connected successfully!');
-</script>
+    function cloudWatch() {
+      document.addEventListener("visibilitychange", async () => {
+        if (!cloudOn()) return;
+        if (document.visibilityState === "hidden") { if (cloudTimer) cloudPush(); return }
+        if (cloudTimer || cloudBusy) return;
+        try {
+          const plan = await cloudSync(true);
+          if (plan.action === "pull" || plan.action === "merge") { toast("Loaded newer data from another device. Reloading…"); setTimeout(() => location.reload(), 1200) }
+          else setSyncStatus("SYNCED", "Saved to your account");
+        } catch (e) { console.warn("Sync check failed", e) }
+      });
+      window.addEventListener("pagehide", () => { if (cloudTimer) cloudPush() });
+      if (sb && sb.auth && sb.auth.onAuthStateChange) sb.auth.onAuthStateChange(evt => { if (evt === "SIGNED_OUT" && window.__atlasCloud && !signingOut) { window.__atlasCloud = false; setSyncStatus("SIGNED OUT"); toast("Your session ended. Reload the page to sign in again.", "warn") } });
+    }
+
+    function showLogin() {
+      return new Promise(resolve => {
+        const back = document.createElement("div"); back.className = "modal-back"; back.id = "authGate"; back.style.alignItems = "center";
+        back.innerHTML = '<div class="modal" style="max-width:380px;margin:auto" role="dialog" aria-modal="true" aria-label="Sign in"><div class="brand" style="margin-bottom:4px">TRAINING ATLAS</div><div class="sub" style="margin-bottom:14px">Sign in to load and save your training data.</div><form id="authForm"><div class="field"><label for="authEmail">Email</label><input id="authEmail" type="email" autocomplete="username" required></div><div class="field" style="margin-top:10px"><label for="authPass">Password</label><input id="authPass" type="password" autocomplete="current-password" required></div><div id="authErr" class="small auth-err" style="min-height:18px;margin:10px 0" role="alert"></div><button class="primary" id="authGo" type="submit" style="width:100%">Sign in</button></form><div style="text-align:center;margin-top:12px"><button type="button" class="linklike" id="authLocal">Use on this device only (no sync)</button></div></div>';
+        document.body.appendChild(back);
+        const err = back.querySelector("#authErr"), go = back.querySelector("#authGo");
+        back.querySelector("#authEmail").focus();
+        back.querySelector("#authLocal").onclick = () => { back.remove(); resolve("local") };
+        back.querySelector("#authForm").addEventListener("submit", async ev => {
+          ev.preventDefault(); err.textContent = ""; go.disabled = true; go.textContent = "Signing in…";
+          try {
+            const r = await sb.auth.signInWithPassword({ email: back.querySelector("#authEmail").value.trim(), password: back.querySelector("#authPass").value });
+            if (r.error) throw r.error;
+            back.remove(); resolve("signed-in");
+          } catch (e) {
+            const m = String((e && e.message) || "");
+            err.textContent = /invalid login|invalid credentials/i.test(m) ? "Wrong email or password." : /fetch|network/i.test(m) ? "No connection. Check your internet and try again." : (m || "Could not sign in.");
+            go.disabled = false; go.textContent = "Sign in";
+          }
+        });
+      });
+    }
+    async function atlasSignOut() {
+      if (!confirm("Sign out on this device? Your data stays saved in your account.")) return;
+      signingOut = true;
+      const ok = cloudOn() ? await cloudPush() : true;
+      if (!ok) { signingOut = false; alert("Could not save to your account, so you were not signed out. Check your connection and try again."); return }
+      try { localStorage.removeItem(STORE); localStorage.removeItem(CLOUD_BASE_KEY); if (window.indexedDB) indexedDB.deleteDatabase(IDB_NAME) } catch (e) { }
+      try { await sb.auth.signOut() } catch (e) { }
+      location.reload();
+    }
+    function addAccountUI(email) {
+      const row = document.querySelector(".top .row"); if (!row || $("acctBtn")) return;
+      row.insertAdjacentHTML("beforeend", (email ? '<span class="sub" id="acctEmail"></span>' : "") + '<button class="mini" id="acctBtn" type="button">' + (email ? "Sign out" : "Sign in") + "</button>");
+      if (email) $("acctEmail").textContent = email;
+      $("acctBtn").onclick = email ? atlasSignOut : () => location.reload();
+    }
+
+    async function atlasBoot() {
+      const shell = document.querySelector(".shell"); let email = "", client = null;
+      shell.style.visibility = "hidden";
+      try {
+        client = window.__ATLAS_SB__ || null;
+        if (!client) { const mod = await import("https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm"); client = mod.createClient(SB_URL, SB_KEY) }
+        sb = client;
+        let session = (await sb.auth.getSession()).data.session;
+        if (!session) { if (await showLogin() === "local") sb = null; else session = (await sb.auth.getSession()).data.session }
+        if (sb && session) {
+          email = (session.user && session.user.email) || "";
+          cloudUser = session.user;
+          try { await cloudSync(HAD_LOCAL_DATA); window.__atlasCloud = true }
+          catch (e) { console.error("Cloud sync failed", e); toast("Cloud sync is unavailable: " + ((e && e.message) || "unknown error") + ". Working on this device only.", "warn") }
+        }
+      } catch (e) { console.warn("Cloud unavailable, running on this device only", e); sb = null }
+      shell.style.visibility = "";
+      init();
+      if (window.__atlasCloud) {
+        setSyncStatus("SYNCED", "Saved to your account");
+        document.querySelectorAll("#settings .notice").forEach(n => { if (/localStorage/.test(n.textContent)) n.textContent = "Your data is saved on this device and synced to your account while you are signed in, so it follows you across devices. An exported JSON backup is still a good extra copy." });
+        cloudWatch();
+      } else if (client) setSyncStatus("LOCAL ONLY", "Not syncing to your account");
+      if (client) addAccountUI(window.__atlasCloud ? email : "");
+    }
+    if (!window.__ATLAS_TEST__) atlasBoot();
+  </script>
 </body>
 
 
